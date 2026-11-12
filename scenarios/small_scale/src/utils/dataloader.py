@@ -1,0 +1,216 @@
+import os
+import pickle
+import torch
+import numpy as np
+import threading
+import multiprocessing as mp
+
+SCENARIO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+DATA_ROOT = os.environ.get("RECAL_DATA_ROOT", os.path.join(SCENARIO_ROOT, "data"))
+
+
+class DataLoader(object):
+    def __init__(self, data, idx, seq_len, horizon, bs, logger, pad_last_sample=False):
+        if pad_last_sample:
+            num_padding = (bs - (len(idx) % bs)) % bs
+            idx_padding = np.repeat(idx[-1:], num_padding, axis=0)
+            idx = np.concatenate([idx, idx_padding], axis=0)
+
+        self.data = data
+
+        self.idx = idx
+        self.size = len(idx)
+        self.bs = bs
+        self.num_batch = int(self.size // self.bs)
+        self.current_ind = 0
+        logger.info(
+            "Sample num: "
+            + str(self.idx.shape[0])
+            + ", Batch num: "
+            + str(self.num_batch)
+        )
+
+        self.x_offsets = np.arange(-(seq_len - 1), 1, 1)
+        self.y_offsets = np.arange(1, (horizon + 1), 1)
+        self.seq_len = seq_len
+        self.horizon = horizon
+
+    def shuffle(self):
+        perm = np.random.permutation(self.size)
+        idx = self.idx[perm]
+        self.idx = idx
+
+    def write_to_shared_array(self, x, y, idx_ind, start_idx, end_idx):
+        for i in range(start_idx, end_idx):
+            x[i] = self.data[idx_ind[i] + self.x_offsets, :, :]
+            y[i] = self.data[idx_ind[i] + self.y_offsets, :, :1]
+
+    def get_iterator(self):
+        self.current_ind = 0
+
+        def _wrapper():
+            while self.current_ind < self.num_batch:
+                start_ind = self.bs * self.current_ind
+                end_ind = min(self.size, self.bs * (self.current_ind + 1))
+                idx_ind = self.idx[start_ind:end_ind, ...]
+
+                x_shape = (
+                    len(idx_ind),
+                    self.seq_len,
+                    self.data.shape[1],
+                    self.data.shape[-1],
+                )
+                x_shared = mp.RawArray("f", int(np.prod(x_shape)))
+                x = np.frombuffer(x_shared, dtype="f").reshape(x_shape)
+                y_shape = (len(idx_ind), self.horizon, self.data.shape[1], 1)
+                y_shared = mp.RawArray("f", int(np.prod(y_shape)))
+                y = np.frombuffer(y_shared, dtype="f").reshape(y_shape)
+
+                array_size = len(idx_ind)
+                num_threads = len(idx_ind) // 2
+                if num_threads == 0:
+                    num_threads = 1
+                chunk_size = array_size // num_threads
+                threads = []
+                for i in range(num_threads):
+                    start_index = i * chunk_size
+                    end_index = (
+                        start_index + chunk_size if i < num_threads - 1 else array_size
+                    )
+
+                    thread = threading.Thread(
+                        target=self.write_to_shared_array,
+                        args=(x, y, idx_ind, start_index, end_index),
+                    )
+                    thread.start()
+                    threads.append(thread)
+
+                for thread in threads:
+                    thread.join()
+
+                yield (x, y)
+                self.current_ind += 1
+
+        return _wrapper()
+
+
+class StandardScaler:
+    def __init__(self, mean, std):
+        self.mean = torch.tensor(mean)
+        self.std = torch.tensor(std)
+
+    def transform(self, data):
+        return (data - self.mean) / self.std
+
+    def inverse_transform(self, data):
+        return (data * self.std) + self.mean
+
+
+def load_dataset(data_path, args, logger):
+    folder_name = (
+        args.years + f"-fewshot{args.fewshot}" if args.fewshot != 100 else args.years
+    )
+
+    if args.seq_len != 12 or args.horizon != 12:
+        folder_name = folder_name + "-long"
+
+    ptr = np.load(os.path.join(data_path, folder_name, "his.npz"), allow_pickle=True)
+    logger.info("Data shape: " + str(ptr["data"].shape))
+    dataloader = {}
+    for cat in ["train", "val", "test"]:
+        idx = np.load(os.path.join(data_path, folder_name, "idx_" + cat + ".npy"))
+        dataloader[cat + "_loader"] = DataLoader(
+            ptr["data"][..., : args.input_dim],
+            idx,
+            args.seq_len,
+            args.horizon,
+            args.bs,
+            logger,
+        )
+
+    scaler = StandardScaler(mean=ptr["mean"], std=ptr["std"])
+    return dataloader, scaler
+
+
+def load_adj_from_pickle(pickle_file):
+    try:
+        with open(pickle_file, "rb") as f:
+            pickle_data = pickle.load(f)
+    except UnicodeDecodeError as e:
+        with open(pickle_file, "rb") as f:
+            pickle_data = pickle.load(f, encoding="latin1")
+    except Exception as e:
+        print("Unable to load data ", pickle_file, ":", e)
+        raise
+    return pickle_data
+
+
+def load_adj_from_numpy(numpy_file):
+    adj = np.load(numpy_file, allow_pickle=True)
+    if isinstance(adj, np.ndarray) and adj.dtype == object and len(adj) > 0:
+        candidate = adj[-1]
+        if isinstance(candidate, np.ndarray):
+            return candidate
+    return adj
+
+
+def get_dataset_info(dataset):
+    d = {
+        "CA": [
+            os.path.join(DATA_ROOT, "ca"),
+            os.path.join(DATA_ROOT, "ca", "ca_rn_adj.npy"),
+            8600,
+        ],
+        "GLA": [
+            os.path.join(DATA_ROOT, "gla"),
+            os.path.join(DATA_ROOT, "gla", "gla_rn_adj.npy"),
+            3834,
+        ],
+        "GBA": [
+            os.path.join(DATA_ROOT, "gba"),
+            os.path.join(DATA_ROOT, "gba", "gba_rn_adj.npy"),
+            2352,
+        ],
+        "PEMS03": [
+            os.path.join(DATA_ROOT, "pems03"),
+            os.path.join(DATA_ROOT, "pems03", "pems03_rn_adj.npy"),
+            358,
+        ],
+        "PEMS04": [
+            os.path.join(DATA_ROOT, "pems04"),
+            os.path.join(DATA_ROOT, "pems04", "pems04_rn_adj.npy"),
+            307,
+        ],
+        "PEMS07": [
+            os.path.join(DATA_ROOT, "pems07"),
+            os.path.join(DATA_ROOT, "pems07", "pems07_rn_adj.npy"),
+            883,
+        ],
+        "PEMS08": [
+            os.path.join(DATA_ROOT, "pems08"),
+            os.path.join(DATA_ROOT, "pems08", "pems08_rn_adj.npy"),
+            170,
+        ],
+        "PEMSBAY": [
+            os.path.join(DATA_ROOT, "pemsbay"),
+            os.path.join(DATA_ROOT, "pemsbay", "pemsbay_rn_adj.npy"),
+            325,
+        ],
+        "METRLA": [
+            os.path.join(DATA_ROOT, "metrla"),
+            os.path.join(DATA_ROOT, "metrla", "metrla_rn_adj.npy"),
+            207,
+        ],
+        "KNOWAIR": [
+            os.path.join(DATA_ROOT, "knowair"),
+            os.path.join(DATA_ROOT, "knowair", "knowair_rn_adj.npy"),
+            184,
+        ],
+        "URBANEV": [
+            os.path.join(DATA_ROOT, "urbanev"),
+            os.path.join(DATA_ROOT, "urbanev", "urbanev_rn_adj.npy"),
+            275,
+        ],
+    }
+    assert dataset in d.keys()
+    return d[dataset]

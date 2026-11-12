@@ -1,0 +1,137 @@
+import os
+import argparse
+import numpy as np
+import sys
+
+SCENARIO_ROOT = str(__import__("pathlib").Path(__file__).resolve().parents[1])
+if SCENARIO_ROOT not in sys.path:
+    sys.path.insert(0, SCENARIO_ROOT)
+import torch
+
+torch.set_num_threads(3)
+from src.models.sttn import STTN
+from src.base.engine import BaseEngine
+from src.utils.args import get_public_config, normalize_eval_method
+from src.utils.dataloader import load_dataset, load_adj_from_numpy, get_dataset_info
+from src.utils.calendar_source import calendar_memory_kwargs
+from src.utils.graph_algo import normalize_adj_mx
+from src.utils.metrics import masked_mae
+from src.utils.logging import get_logger
+
+
+def set_seed(seed):
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = False
+    torch.backends.cudnn.benchmark = False
+
+
+def get_config():
+    parser = get_public_config()
+    parser.add_argument("--model_name", type=str, default="stnn")
+    parser.add_argument("--adj_type", type=str, default="doubletransition")
+    parser.add_argument("--blocks", type=int, default=2)
+    parser.add_argument("--mlp_expand", type=int, default=2)
+    parser.add_argument("--hid_dim", type=int, default=32)
+    parser.add_argument("--end_dim", type=int, default=512)
+    parser.add_argument("--lrate", type=float, default=0.001)
+    parser.add_argument("--wdecay", type=float, default=0.0001)
+    parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--clip_grad_value", type=float, default=5)
+    args = parser.parse_args()
+    args.eval_method = normalize_eval_method(args.eval_method)
+    log_dir = (
+        os.path.join(SCENARIO_ROOT, "experiments", args.model_name, args.dataset)
+        + os.sep
+    )
+    if args.fewshot != 100:
+        log_dir = log_dir + f"-fewshot{args.fewshot}"
+    else:
+        log_dir = log_dir + f"-fulltrain"
+    log_dir = os.environ.get("RECAL_OUTPUT_DIR", log_dir)
+    if args.bs != 1:
+        logger = get_logger(log_dir, __name__, "record_s{}.log".format(args.seed))
+    else:
+        folder_name = "few-shot" if args.fewshot != 100 else "full-shot"
+        if args.dataset == "CA" or args.dataset == "GLA" or args.dataset == "GBA":
+            folder_name = "large"
+        if args.seq_len != 12 or args.horizon != 12:
+            folder_name = "long_term"
+        logger = get_logger(
+            log_dir,
+            __name__,
+            "{}{}_record_s{}.log".format(args.eval_method, args.eval_tag, args.seed),
+        )
+    logger.info(args)
+    return (args, log_dir, logger)
+
+
+def main():
+    args, log_dir, logger = get_config()
+    set_seed(args.seed)
+    device = torch.device(args.device)
+    data_path, adj_path, node_num = get_dataset_info(args.dataset)
+    logger.info("Adj path: " + adj_path)
+    adj_mx = load_adj_from_numpy(adj_path)
+    adj_mx = normalize_adj_mx(adj_mx, args.adj_type)
+    supports = [torch.tensor(i).to(device) for i in adj_mx]
+    dataloader, scaler = load_dataset(data_path, args, logger)
+    model = STTN(
+        node_num=node_num,
+        input_dim=args.input_dim,
+        output_dim=args.output_dim,
+        device=device,
+        supports=supports,
+        blocks=args.blocks,
+        mlp_expand=args.mlp_expand,
+        hidden_channels=args.hid_dim,
+        end_channels=args.end_dim,
+        dropout=args.dropout,
+    )
+    loss_fn = masked_mae
+    optimizer = torch.optim.Adam(
+        model.parameters(), lr=args.lrate, weight_decay=args.wdecay
+    )
+    scheduler = None
+    engine = BaseEngine(
+        device=device,
+        model=model,
+        dataloader=dataloader,
+        scaler=scaler,
+        sampler=None,
+        loss_fn=loss_fn,
+        lrate=args.lrate,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        clip_grad_value=args.clip_grad_value,
+        max_epochs=args.max_epochs,
+        patience=args.patience,
+        log_dir=log_dir,
+        logger=logger,
+        eval_method=args.eval_method,
+        seed=args.seed,
+    )
+    if args.mode == "train":
+        engine.train()
+    else:
+        engine.evaluate_with_recal(
+            args.mode,
+            recal_rank=getattr(args, "recal_rank", 4),
+            recal_lr=getattr(args, "recal_lr", 0.0001),
+            recal_target_offset=getattr(args, "recal_target_offset", 1),
+            recal_max_batches=getattr(args, "recal_max_batches", 0),
+            recal_update_interval=getattr(args, "recal_update_interval", 1),
+            recal_maintenance_budget=getattr(args, "recal_maintenance_budget", 0),
+            recal_execution_backend=getattr(
+                args, "recal_execution_backend", "reference"
+            ),
+            recal_feedback_mode=getattr(args, "recal_feedback_mode", "legacy"),
+            recal_allowed_lateness=getattr(args, "recal_allowed_lateness", 0),
+            recal_feedback_trace=getattr(args, "recal_feedback_trace", None),
+            **calendar_memory_kwargs(args, data_path),
+        )
+
+
+if __name__ == "__main__":
+    main()
